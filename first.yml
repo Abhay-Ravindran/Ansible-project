@@ -1,0 +1,376 @@
+---
+- name: playbook for project
+  hosts: localhost
+  tasks:
+    - name: Download and Install MySQL repository
+      yum:
+        name: https://repo.mysql.com/mysql84-community-release-el9-1.noarch.rpm
+        state: present
+        disable_gpg_check: yes
+
+    - name: Install MySQL server
+      yum:
+        name: mysql-community-server
+        state: present
+      register: mysql_installation
+
+    - name: Install Python
+      yum:
+        name: python3-pip
+        state: present
+
+    - name: Install MySQL Python dependency
+      pip:
+        name: PyMySQL
+        executable: pip3
+
+    - name: Enable and start MySQL
+      service:
+        name: mysqld
+        enabled: yes
+        state: started
+
+    - name: Install PHP and required extensions
+      yum:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - php8.3
+        - php8.3-fpm
+        - php8.3-mysqlnd
+        - php8.3-cli
+        - php8.3-common
+        - php8.3-opcache
+        - php8.3-mbstring
+        - php8.3-xml
+
+    - name: Enable and start PHP-FPM
+      service:
+        name: php-fpm
+        state: started
+        enabled: yes
+
+    - name: Install Nginx
+      yum:
+        name: nginx
+        state: present
+
+    - name: Enable and start Nginx
+      service:
+        name: nginx
+        enabled: yes
+        state: started
+
+    - name: Create project user
+      user:
+        name: myprj
+        password: "{{ 'project' | password_hash('sha512') }}"
+
+    - name: Create abhay/public directory structure
+      file:
+        path: /home/myprj/abhay/public
+        state: directory
+        owner: myprj
+        group: myprj
+        mode: '0755'
+
+    - name: Enable SELinux HTTP home directory access
+      seboolean:
+        name: httpd_enable_homedirs
+        state: yes
+        persistent: yes
+
+    - name: Create SFTP configuration file
+      copy:
+        dest: /etc/ssh/sshd_config.d/sftp.conf
+        content: |
+          Match Group sftpusers
+              ChrootDirectory %h
+              ForceCommand internal-sftp
+              AllowTcpForwarding no
+              X11Forwarding no
+              PasswordAuthentication yes
+
+    - name: Restart SSH service
+      service:
+        name: sshd
+        state: restarted
+
+    - name: Create sftpusers group
+      group:
+        name: sftpusers
+        state: present
+
+    - name: Add myprj user to sftpusers & nginx groups
+      user:
+        name: myprj
+        groups: [ sftpusers, nginx ]
+        append: yes
+
+    - name: Set permissions for /home/myprj for SFTP
+      file:
+        path: /home/myprj
+        state: directory
+        owner: root
+        group: sftpusers
+        mode: '0755'
+
+    - name: Set permissions for abhay/public directory
+      file:
+        path: /home/myprj/abhay/public
+        state: directory
+        owner: myprj
+        group: sftpusers
+        mode: '0755'
+
+    - name: Download and extract phpMyAdmin
+      unarchive:
+        src: https://www.phpmyadmin.net/downloads/phpMyAdmin-latest-all-languages.tar.gz
+        dest: /home/myprj/abhay/public/
+        remote_src: yes
+        creates: /home/myprj/abhay/public/phpmyadmin
+
+    - name: Rename phpmyadmin folder name
+      command: mv /home/myprj/abhay/public/phpMyAdmin-5.2.2-all-languages/ /home/myprj/abhay/public/phpmyadmin/
+      args:
+        removes: /home/myprj/abhay/public/phpMyAdmin-5.2.2-all-languages/
+        creates: /home/myprj/abhay/public/phpmyadmin/
+
+    - name: Update mysql configuration file
+      copy:
+        dest: /etc/my.cnf
+        content: |
+          # For advice on how to change settings please see
+          # http://dev.mysql.com/doc/refman/8.4/en/server-configuration-defaults.html
+
+          [mysqld]
+          mysql_native_password=ON
+          #
+          # Remove leading # and set to the amount of RAM for the most important data
+          # cache in MySQL. Start at 70% of total RAM for dedicated server, else 10%.
+          # innodb_buffer_pool_size = 128M
+          #
+          # Remove the leading "# " to disable binary logging
+          # Binary logging captures changes between backups and is enabled by
+          # default. It's default setting is log_bin=binlog
+          # disable_log_bin
+          #
+          # Remove leading # to set options mainly useful for reporting servers.
+          # The server defaults are faster for transactions and fast SELECTs.
+          # Adjust sizes as needed, experiment to find the optimal values.
+          # join_buffer_size = 128M
+          # sort_buffer_size = 2M
+          # read_rnd_buffer_size = 2M
+
+          datadir=/var/lib/mysql
+          socket=/var/lib/mysql/mysql.sock
+
+          log-error=/var/log/mysqld.log
+          pid-file=/var/run/mysqld/mysqld.pid
+
+    - name: Restart mysqld
+      service:
+        name: mysqld
+        state: restarted
+
+    - name: Get MySQL temporary root password
+      shell: sudo grep 'temporary password' /var/log/mysqld.log | awk '{print $NF}'
+      register: mysql_temp_password
+      changed_when: false
+      when: mysql_installation.changed
+
+    - name: Update MySQL root password
+      shell: >
+        mysqladmin --user=root --password="{{ mysql_temp_password.stdout }}"
+        password "Ansible@1"
+      ignore_errors: yes
+      when: mysql_installation.changed
+
+    - name: Configure MySQL database and user
+      community.mysql.mysql_db:
+        login_user: root
+        login_password: "Ansible@1"
+        name: wordpress
+        state: present
+      when: mysql_installation.changed
+
+    - name: Create WordPress user in MySQL
+      community.mysql.mysql_user:
+        login_user: root
+        login_password: "Ansible@1"
+        name: wordpress
+        password: "WPUser@1"
+        priv: 'wordpress.*:ALL'
+        host: localhost
+        state: present
+      when: mysql_installation.changed
+
+    - name: Download WP-CLI
+      get_url:
+        url: https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar
+        dest: /usr/local/bin/wp
+        mode: '0755'
+
+    - name: Download WordPress
+      command: sudo wp core download --path=/home/myprj/abhay/public --locale=en_US --allow-root
+
+    - name: Configure WordPress
+      command: sudo wp config create --path=/home/myprj/abhay/public --dbname=wordpress --dbuser=wordpress --dbpass=WPUser@1 --dbhost=localhost --dbprefix=wp_ --allow-root
+      
+    - name: Install WordPress
+      command: sudo wp core install --path=/home/myprj/abhay/public --url=http://abhay.adnansal.im --title=WordPress --admin_user=abhay --admin_email=abhayravi639@gmail.com --admin_password=abhay --allow-root
+      ignore_errors: yes
+
+    - name: Configure Nginx for WordPress and phpMyAdmin
+      copy:
+        dest: /etc/nginx/conf.d/project.conf
+        content: |
+          server {
+            listen 80;
+            listen [::]:80;
+            server_name abhay.adnansal.im;
+
+            root /home/myprj/abhay/public;
+            index index.php index.html index.htm;
+
+            location / {
+                try_files $uri $uri/ /index.php?$query_string;
+            }
+
+            location ~ \.php$ {
+                include fastcgi_params;
+                fastcgi_pass unix:/run/php-fpm/www.sock;
+                fastcgi_index index.php;
+                fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+            }
+
+            location ~ /\.ht {
+                deny all;
+            }
+
+            location /phpmyadmin {
+                root /home/myprj/abhay/public;
+                index index.php;
+                try_files $uri $uri/ /index.php;
+            }
+
+            location ~ ^/phpmyadmin/(.+\.php)$ {
+                root /home/myprj/abhay/public;
+                fastcgi_pass unix:/run/php-fpm/www.sock;
+                fastcgi_index index.php;
+                include fastcgi.conf;
+            }
+          }
+
+    - name: Update nginx.conf
+      copy:
+        dest: /etc/nginx/nginx.conf
+        content: |
+          # For more information on configuration, see:
+          #   * Official English Documentation: http://nginx.org/en/docs/
+          #   * Official Russian Documentation: http://nginx.org/ru/docs/
+
+          user nginx;
+          worker_processes auto;
+          error_log /var/log/nginx/error.log notice;
+          pid /run/nginx.pid;
+
+          # Load dynamic modules. See /usr/share/doc/nginx/README.dynamic.
+          include /usr/share/nginx/modules/*.conf;
+
+          events {
+              worker_connections 1024;
+          }
+
+          http {
+              log_format  main  '$remote_addr - $remote_user [$time_local] "$request" '
+                                '$status $body_bytes_sent "$http_referer" '
+                                '"$http_user_agent" "$http_x_forwarded_for"';
+
+              access_log  /var/log/nginx/access.log  main;
+
+              sendfile            on;
+              tcp_nopush          on;
+              keepalive_timeout   65;
+              types_hash_max_size 4096;
+
+              include             /etc/nginx/mime.types;
+              default_type        application/octet-stream;
+
+              # Load modular configuration files from the /etc/nginx/conf.d directory.
+              # See http://nginx.org/en/docs/ngx_core_module.html#include
+              # for more information.
+              include /etc/nginx/conf.d/*.conf;
+
+              server {
+                  listen       80;
+                  listen       [::]:80;
+                  server_name  _;
+                  root         /home/myprj/abhay/public;
+
+                  # Load configuration files for the default server block.
+                  include /etc/nginx/default.d/*.conf;
+
+                  error_page 404 /404.html;
+                  location = /404.html {
+                  }
+
+                  error_page 500 502 503 504 /50x.html;
+                  location = /50x.html {
+                  }
+              }
+
+          # Settings for a TLS enabled server.
+          #
+          #    server {
+          #        listen       443 ssl;
+          #        listen       [::]:443 ssl;
+          #        http2        on;
+          #        server_name  _;
+          #        root         /usr/share/nginx/html;
+          #
+          #        ssl_certificate "/etc/pki/nginx/server.crt";
+          #        ssl_certificate_key "/etc/pki/nginx/private/server.key";
+          #        ssl_session_cache shared:SSL:1m;
+          #        ssl_session_timeout  10m;
+          #        ssl_ciphers PROFILE=SYSTEM;
+          #        ssl_prefer_server_ciphers on;
+          #
+          #        # Load configuration files for the default server block.
+          #        include /etc/nginx/default.d/*.conf;
+          #
+          #        error_page 404 /404.html;
+          #        location = /404.html {
+          #        }
+          #
+          #        error_page 500 502 503 504 /50x.html;
+          #        location = /50x.html {
+          #        }
+          #    }
+          }
+
+    - name: Reload Nginx
+      service:
+        name: nginx
+        state: reloaded
+
+    - name: Restart Nginx and PHP-FPM
+      service:
+        name: "{{ item }}"
+        state: restarted
+      loop:
+        - php-fpm
+        - nginx
+
+    - name: Install Certbot and its dependency
+      yum:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - certbot
+        - python3-certbot-nginx
+      register: certbot_installation
+
+    - name: Generate SSL Certificate using Let's Encrypt
+      command: certbot --nginx -d abhay.adnansal.im --agree-tos --email abhayravi639@gmail.com --non-interactive
+      when: certbot_installation.changed
